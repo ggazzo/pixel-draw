@@ -7,7 +7,7 @@
 <style>
   body { margin: 0; font-family: system-ui, sans-serif; background: #111; color: #eee; display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 16px; }
   .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: center; }
-  button, select { font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid #444; background: #222; color: #eee; cursor: pointer; }
+  button, select, .btn { font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid #444; background: #222; color: #eee; cursor: pointer; }
   button.on { background: #2a6; border-color: #2a6; }
   canvas { image-rendering: pixelated; width: min(90vw, 80vh); aspect-ratio: 1; background: #000; touch-action: none; cursor: crosshair; }
   #status { font-size: 14px; opacity: .8; }
@@ -21,6 +21,7 @@
   <button id="pen" class="on">Pincel</button>
   <button id="eraser">Borracha</button>
   <button id="clear">Limpar</button>
+  <label><input type="file" id="file" accept="image/*" hidden><span class="btn">Imagem</span></label>
   <label>Brilho <input type="range" id="bright" min="5" max="100" value="60"></label>
 </div>
 <canvas id="c"></canvas>
@@ -99,11 +100,16 @@ $('connect').onclick = async () => {
 };
 
 document.addEventListener('dragover', e => e.preventDefault());
-document.addEventListener('drop', async e => {
+document.addEventListener('drop', e => {
   e.preventDefault();
-  const file = e.dataTransfer.files[0];
-  if (!file?.type.startsWith('image/')) return;
-  const img = await createImageBitmap(file);
+  if (!e.dataTransfer.files[0]) return status('Arraste um arquivo de imagem do computador');
+  loadImage(e.dataTransfer.files[0]);
+});
+$('file').onchange = e => e.target.files[0] && loadImage(e.target.files[0]);
+
+async function loadImage(file) {
+  let img;
+  try { img = await createImageBitmap(file); } catch { return status('Formato de imagem não suportado: ' + (file.type || file.name)); }
   const off = new OffscreenCanvas(N, N).getContext('2d');
   const s = Math.min(N / img.width, N / img.height), w = img.width * s, h = img.height * s;
   off.drawImage(img, (N - w) / 2, (N - h) / 2, w, h);
@@ -114,7 +120,8 @@ document.addEventListener('drop', async e => {
   }
   ctx.drawImage(off.canvas, 0, 0);
   if (char) uploadPng(new Uint8Array(await (await off.canvas.convertToBlob({ type: 'image/png' })).arrayBuffer()));
-});
+  else status('Imagem carregada — conecte para enviar ao painel');
+}
 
 // Image upload: PNG split in 4096-byte chunks, each prefixed with a 9-byte header
 function uploadPng(png) {
