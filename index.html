@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pixel Draw</title>
+<style>
+  body { margin: 0; font-family: system-ui, sans-serif; background: #111; color: #eee; display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 16px; }
+  .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: center; }
+  button, select { font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid #444; background: #222; color: #eee; cursor: pointer; }
+  button.on { background: #2a6; border-color: #2a6; }
+  canvas { image-rendering: pixelated; width: min(90vw, 80vh); aspect-ratio: 1; background: #000; touch-action: none; cursor: crosshair; }
+  #status { font-size: 14px; opacity: .8; }
+</style>
+</head>
+<body>
+<div class="bar">
+  <button id="connect">Conectar</button>
+  <select id="size"><option>64</option><option>32</option><option>16</option></select>
+  <input type="color" id="color" value="#ff0000">
+  <button id="pen" class="on">Pincel</button>
+  <button id="eraser">Borracha</button>
+  <button id="clear">Limpar</button>
+  <label>Brilho <input type="range" id="bright" min="5" max="100" value="60"></label>
+</div>
+<canvas id="c"></canvas>
+<div id="status">Desconectado</div>
+
+<script>
+// iDotMatrix BLE protocol (same as github.com/derkalle4/python3-idotmatrix-library)
+const SERVICES = [0x00fa, 0xfa00], WRITE_CHAR = 0xfa02;
+const $ = id => document.getElementById(id);
+const canvas = $('c'), ctx = canvas.getContext('2d');
+let N, pixels, char = null, erasing = false, queue = Promise.resolve();
+
+function reset() {
+  N = +$('size').value;
+  canvas.width = canvas.height = N;
+  pixels = new Array(N * N).fill('#000000');
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, N, N);
+}
+
+function send(bytes) {
+  if (!char) return;
+  // ponytail: serial queue, the panel drops packets when writes overlap
+  queue = queue.then(() => char.writeValueWithoutResponse(new Uint8Array(bytes))).catch(e => status(e.message));
+}
+
+function setPixel(x, y, hex) {
+  if (x < 0 || y < 0 || x >= N || y >= N || pixels[y * N + x] === hex) return;
+  pixels[y * N + x] = hex;
+  ctx.fillStyle = hex; ctx.fillRect(x, y, 1, 1);
+  const n = parseInt(hex.slice(1), 16);
+  send([10, 0, 5, 1, 0, n >> 16, (n >> 8) & 255, n & 255, x, y]);
+}
+
+function line(x0, y0, x1, y1, hex) {
+  const dx = Math.abs(x1 - x0), dy = -Math.abs(y1 - y0), sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+  let err = dx + dy;
+  for (;;) {
+    setPixel(x0, y0, hex);
+    if (x0 === x1 && y0 === y1) return;
+    const e2 = 2 * err;
+    if (e2 >= dy) { err += dy; x0 += sx; }
+    if (e2 <= dx) { err += dx; y0 += sy; }
+  }
+}
+
+function cell(ev) {
+  const r = canvas.getBoundingClientRect();
+  return [Math.floor((ev.clientX - r.left) / r.width * N), Math.floor((ev.clientY - r.top) / r.height * N)];
+}
+
+let last = null;
+canvas.addEventListener('pointerdown', ev => { canvas.setPointerCapture(ev.pointerId); last = cell(ev); line(...last, ...last, brush()); });
+canvas.addEventListener('pointermove', ev => { if (!last) return; const p = cell(ev); line(...last, ...p, brush()); last = p; });
+canvas.addEventListener('pointerup', () => last = null);
+const brush = () => erasing ? '#000000' : $('color').value;
+
+const status = t => $('status').textContent = t;
+
+$('connect').onclick = async () => {
+  if (!navigator.bluetooth) return status('Navegador sem Web Bluetooth — use Chrome ou Edge.');
+  try {
+    const dev = await navigator.bluetooth.requestDevice({ filters: [{ namePrefix: 'IDM-' }], optionalServices: SERVICES });
+    dev.addEventListener('gattserverdisconnected', () => { char = null; status('Desconectado'); });
+    const server = await dev.gatt.connect();
+    for (const s of await server.getPrimaryServices()) {
+      char = await s.getCharacteristic(WRITE_CHAR).catch(() => null);
+      if (char) break;
+    }
+    if (!char) throw new Error('Characteristic FA02 não encontrada');
+    send([5, 0, 7, 1, 1]);            // screen on
+    send([5, 0, 4, 1, 1]);            // enter DIY mode (clears panel)
+    send([5, 0, 4, 128, +$('bright').value]);
+    reset();
+    status('Conectado: ' + dev.name);
+  } catch (e) { status(e.message); }
+};
+
+document.addEventListener('dragover', e => e.preventDefault());
+document.addEventListener('drop', async e => {
+  e.preventDefault();
+  const file = e.dataTransfer.files[0];
+  if (!file?.type.startsWith('image/')) return;
+  const img = await createImageBitmap(file);
+  const off = new OffscreenCanvas(N, N).getContext('2d');
+  const s = Math.min(N / img.width, N / img.height), w = img.width * s, h = img.height * s;
+  off.drawImage(img, (N - w) / 2, (N - h) / 2, w, h);
+  const data = off.getImageData(0, 0, N, N).data;
+  for (let i = 0; i < N * N; i++) {
+    const a = data[i * 4 + 3] / 255;
+    pixels[i] = '#' + [0, 1, 2].map(c => Math.round(data[i * 4 + c] * a).toString(16).padStart(2, '0')).join('');
+  }
+  ctx.drawImage(off.canvas, 0, 0);
+  if (char) uploadPng(new Uint8Array(await (await off.canvas.convertToBlob({ type: 'image/png' })).arrayBuffer()));
+});
+
+// Image upload: PNG split in 4096-byte chunks, each prefixed with a 9-byte header
+function uploadPng(png) {
+  send([5, 0, 4, 1, 1]);
+  const chunks = [];
+  for (let i = 0; i < png.length; i += 4096) chunks.push(png.subarray(i, i + 4096));
+  const idk = png.length + chunks.length;
+  const out = [];
+  chunks.forEach((chunk, i) => {
+    out.push(idk & 255, idk >> 8, 0, 0, i ? 2 : 0,
+      png.length & 255, (png.length >> 8) & 255, (png.length >> 16) & 255, png.length >>> 24, ...chunk);
+  });
+  status('Enviando imagem…');
+  // ponytail: 182 bytes fits macOS' default BLE MTU; raise if the panel negotiates more
+  for (let i = 0; i < out.length; i += 182) {
+    const piece = new Uint8Array(out.slice(i, i + 182));
+    queue = queue.then(() => char.writeValueWithResponse(piece));
+  }
+  queue = queue.then(() => status('Imagem enviada'), e => status(e.message));
+}
+
+$('size').onchange = reset;
+$('clear').onclick = () => { reset(); send([5, 0, 4, 1, 1]); };
+$('bright').oninput = e => send([5, 0, 4, 128, +e.target.value]);
+$('pen').onclick = () => { erasing = false; $('pen').classList.add('on'); $('eraser').classList.remove('on'); };
+$('eraser').onclick = () => { erasing = true; $('eraser').classList.add('on'); $('pen').classList.remove('on'); };
+
+reset();
+</script>
+</body>
+</html>
